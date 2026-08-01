@@ -16,14 +16,6 @@ st.set_page_config(page_title="Meta Ad Set Age Targeting", layout="wide")
 # =========================================================
 # Login — same secret name used by the original application
 # =========================================================
-def get_secret(name, default=None):
-    """Read a Streamlit secret without crashing the app during startup."""
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -32,17 +24,10 @@ def check_password():
         return True
 
     st.title("🔐 Login Required")
-
-    configured_password = str(get_secret("APP_PASSWORD", "")).strip()
-    if not configured_password:
-        st.error("APP_PASSWORD is missing from Streamlit Secrets.")
-        st.code('APP_PASSWORD = "YOUR_PASSWORD"', language="toml")
-        return False
-
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        if password == configured_password:
+        if password == st.secrets["APP_PASSWORD"]:
             st.session_state["password_correct"] = True
             st.rerun()
         else:
@@ -59,13 +44,8 @@ if not check_password():
 # Meta configuration — keeps the original secret names
 # =========================================================
 BASE_URL = "https://graph.facebook.com"
-API_VERSION = str(get_secret("META_API_VERSION", "v26.0")).strip() or "v26.0"
-ACCESS_TOKEN = str(get_secret("META_ACCESS_TOKEN", "")).strip()
-
-if not ACCESS_TOKEN:
-    st.error("META_ACCESS_TOKEN is missing from Streamlit Secrets.")
-    st.code('META_ACCESS_TOKEN = "YOUR_META_ACCESS_TOKEN"', language="toml")
-    st.stop()
+API_VERSION = st.secrets.get("META_API_VERSION", "v26.0")
+ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
 
 DEFAULT_BUSINESS_IDS = [
     "751488620224306",   # El - Okaby
@@ -73,7 +53,7 @@ DEFAULT_BUSINESS_IDS = [
 ]
 
 try:
-    configured_business_ids = get_secret("BUSINESS_IDS", DEFAULT_BUSINESS_IDS)
+    configured_business_ids = st.secrets.get("BUSINESS_IDS", DEFAULT_BUSINESS_IDS)
     if isinstance(configured_business_ids, str):
         BUSINESS_IDS = [
             value.strip()
@@ -821,26 +801,22 @@ with filter_col_2:
 if selected_account != "All" and not filtered.empty:
     filtered = filtered[filtered["account_name"] == selected_account].copy()
 
+campaign_status_options = (
+    sorted(filtered["campaign_status"].dropna().astype(str).unique().tolist())
+    if not filtered.empty
+    else []
+)
 with filter_col_3:
-    selected_campaign_filter = st.selectbox(
-        "Campaign Filter",
-        [
-            "Active Campaigns",
-            "All Campaigns",
-            "Not Active Campaigns",
-        ],
+    selected_campaign_status = st.selectbox(
+        "Campaign Status",
+        ["All"] + campaign_status_options,
         index=0,
-        help=(
-            "Active Campaigns يعرض الكامبينات التي ترجعها Meta بحالة "
-            "effective_status = ACTIVE فقط."
-        ),
     )
 
-if not filtered.empty:
-    if selected_campaign_filter == "Active Campaigns":
-        filtered = filtered[filtered["campaign_status"] == "Active"].copy()
-    elif selected_campaign_filter == "Not Active Campaigns":
-        filtered = filtered[filtered["campaign_status"] != "Active"].copy()
+if selected_campaign_status != "All" and not filtered.empty:
+    filtered = filtered[
+        filtered["campaign_status"] == selected_campaign_status
+    ].copy()
 
 adset_status_options = (
     sorted(filtered["adset_status"].dropna().astype(str).unique().tolist())
