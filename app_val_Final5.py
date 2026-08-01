@@ -2,6 +2,8 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,7 +14,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Meta Ad Set Age Targeting", layout="wide")
 
-APP_BUILD = "2026-08-02-csv-business-filter-v2"
+APP_BUILD = "2026-08-02-dynamic-business-date-filter-v3"
 
 
 # =========================================================
@@ -69,33 +71,32 @@ if not ACCESS_TOKEN:
     st.code('META_ACCESS_TOKEN = "YOUR_META_ACCESS_TOKEN"', language="toml")
     st.stop()
 
-DEFAULT_BUSINESS_IDS = [
-    "751488620224306",   # El - Okaby
-    "1178859133269743",  # VAL
-]
-
-BUSINESS_NAME_BY_ID = {
+# Businesses are discovered dynamically from the token.
+# BUSINESS_IDS remains optional only as an extra fallback for System User tokens
+# or businesses that are not returned by /me/businesses.
+KNOWN_BUSINESS_NAME_BY_ID = {
     "751488620224306": "El - Okaby",
     "1178859133269743": "VAL",
 }
 DIRECT_BUSINESS_NAME = "Direct / Assigned"
+APP_TIMEZONE = ZoneInfo("Africa/Cairo")
 
 try:
-    configured_business_ids = get_secret("BUSINESS_IDS", DEFAULT_BUSINESS_IDS)
+    configured_business_ids = get_secret("BUSINESS_IDS", [])
     if isinstance(configured_business_ids, str):
-        BUSINESS_IDS = [
+        EXTRA_BUSINESS_IDS = [
             value.strip()
             for value in configured_business_ids.split(",")
             if value.strip()
         ]
     else:
-        BUSINESS_IDS = [
+        EXTRA_BUSINESS_IDS = [
             str(value).strip()
             for value in configured_business_ids
             if str(value).strip()
         ]
 except Exception:
-    BUSINESS_IDS = DEFAULT_BUSINESS_IDS
+    EXTRA_BUSINESS_IDS = []
 
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
 
@@ -171,7 +172,7 @@ def source_is_okaby(source: str) -> bool:
 
 def business_name_from_source(source: str) -> str:
     source_text = str(source)
-    for business_id, business_name in BUSINESS_NAME_BY_ID.items():
+    for business_id, business_name in KNOWN_BUSINESS_NAME_BY_ID.items():
         if business_id in source_text:
             return business_name
     return DIRECT_BUSINESS_NAME
@@ -188,6 +189,40 @@ def combine_business_names(values) -> str:
     if specific_names:
         return " | ".join(specific_names)
     return DIRECT_BUSINESS_NAME
+
+
+def combine_unique_text(values) -> str:
+    output = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in output:
+            output.append(text)
+    return " | ".join(output)
+
+
+def current_cairo_date():
+    return datetime.now(APP_TIMEZONE).date()
+
+
+def delivery_window_dates(today=None):
+    today = today or current_cairo_date()
+    this_month_start = today.replace(day=1)
+    last_month_end = this_month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+    return {
+        "today": today,
+        "yesterday": today - timedelta(days=1),
+        "last_7d_start": today - timedelta(days=6),
+        "this_month_start": this_month_start,
+        "last_month_start": last_month_start,
+        "last_month_end": last_month_end,
+        "query_since": last_month_start,
+        "query_until": today,
+    }
+
+
+def delivered_in_range(delivery_dates, start_date, end_date):
+    return any(start_date <= item <= end_date for item in delivery_dates)
 
 
 def detect_business_unit(account_name="", campaign_name="", source=""):
@@ -335,90 +370,194 @@ def fetch_all_pages(url, params=None):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def get_accessible_businesses():
+    """Discover every Business visible to the token; optional IDs are fallback extras."""
+    errors = []
+    discovered = {}
+
+    url = f"{BASE_URL}/{API_VERSION}/me/businesses"
+    params = {
+        "fields": "id,name",
+        "access_token": ACCESS_TOKEN,
+        "limit": 500,
+    }
+    try:
+        for row in fetch_all_pages(url, params):
+            business_id = str(row.get("id", "")).strip()
+            if business_id:
+                discovered[business_id] = str(
+                    row.get("name") or KNOWN_BUSINESS_NAME_BY_ID.get(business_id) or f"Business {business_id}"
+                )
+    except Exception as exc:
+        message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
+        errors.append(
+            "me/businesses: " + message
+            + " — add business_management permission if you want automatic Business discovery."
+        )
+
+    for business_id in EXTRA_BUSINESS_IDS:
+        discovered.setdefault(
+            str(business_id),
+            KNOWN_BUSINESS_NAME_BY_ID.get(str(business_id), f"Business {business_id}"),
+        )
+
+    businesses_df = pd.DataFrame(
+        [
+            {"business_id": business_id, "business_name": business_name}
+            for business_id, business_name in sorted(
+                discovered.items(), key=lambda item: item[1].casefold()
+            )
+        ]
+    )
+    return businesses_df, errors
+
+
+def _prepare_account_rows(rows, source_name, source_business_id="", source_business_name=""):
+    output = []
+    for raw in rows:
+        item = dict(raw)
+        owner_business = item.get("business") if isinstance(item.get("business"), dict) else {}
+        owner_business_id = str(owner_business.get("id", "")).strip()
+        owner_business_name = str(owner_business.get("name", "")).strip()
+
+        business_id = str(source_business_id or owner_business_id).strip()
+        business_name = str(
+            source_business_name
+            or owner_business_name
+            or KNOWN_BUSINESS_NAME_BY_ID.get(business_id)
+            or DIRECT_BUSINESS_NAME
+        ).strip()
+
+        item["source"] = source_name
+        item["business_id"] = business_id
+        item["business_name"] = business_name
+        item["owner_business_id"] = owner_business_id
+        item["owner_business_name"] = owner_business_name
+        item.pop("business", None)
+        output.append(item)
+    return output
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_ad_accounts():
-    all_dfs = []
+    """Load all Ad Accounts accessible to the token, without fixed Business filtering."""
+    all_rows = []
     errors = []
 
-    sources = [
-        (
-            "me/adaccounts",
-            f"{BASE_URL}/{API_VERSION}/me/adaccounts",
-            DIRECT_BUSINESS_NAME,
-        ),
-    ]
-
-    for business_id in BUSINESS_IDS:
-        business_name = BUSINESS_NAME_BY_ID.get(
-            str(business_id),
-            f"Business {business_id}",
+    direct_url = f"{BASE_URL}/{API_VERSION}/me/adaccounts"
+    direct_params = {
+        "fields": "id,account_id,name,account_status,currency,business{id,name}",
+        "access_token": ACCESS_TOKEN,
+        "limit": 500,
+    }
+    direct_prepared_rows = []
+    try:
+        direct_rows = fetch_all_pages(direct_url, direct_params)
+        direct_prepared_rows = _prepare_account_rows(
+            direct_rows,
+            source_name="me/adaccounts",
         )
-        sources.extend(
-            [
-                (
-                    f"business/{business_id}/owned_ad_accounts",
-                    f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts",
-                    business_name,
-                ),
-                (
-                    f"business/{business_id}/client_ad_accounts",
-                    f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts",
-                    business_name,
-                ),
-            ]
-        )
+        all_rows.extend(direct_prepared_rows)
+    except Exception as exc:
+        message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
+        errors.append(f"me/adaccounts: {message}")
 
-    for source_name, url, business_name in sources:
-        try:
-            params = {
-                "fields": "id,account_id,name,account_status,currency",
-                "access_token": ACCESS_TOKEN,
-                "limit": 500,
+    businesses_df, business_errors = get_accessible_businesses()
+    errors.extend(business_errors)
+
+    # Business IDs exposed on directly assigned Ad Accounts are another discovery source.
+    direct_businesses = pd.DataFrame(
+        [
+            {
+                "business_id": str(row.get("owner_business_id", "")).strip(),
+                "business_name": str(row.get("owner_business_name", "")).strip(),
             }
-            rows = fetch_all_pages(url, params)
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                df["source"] = source_name
-                df["business_name"] = business_name
-                all_dfs.append(df)
-        except Exception as exc:
-            message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
-            errors.append(f"{source_name}: {message}")
+            for row in direct_prepared_rows
+            if str(row.get("owner_business_id", "")).strip()
+        ]
+    )
+    if not direct_businesses.empty:
+        if businesses_df.empty:
+            businesses_df = direct_businesses
+        else:
+            businesses_df = pd.concat(
+                [businesses_df, direct_businesses], ignore_index=True
+            )
+        businesses_df["business_name"] = businesses_df.apply(
+            lambda row: str(row.get("business_name", "")).strip()
+            or KNOWN_BUSINESS_NAME_BY_ID.get(
+                str(row.get("business_id", "")).strip(),
+                f"Business {row.get('business_id', '')}",
+            ),
+            axis=1,
+        )
+        businesses_df = (
+            businesses_df.drop_duplicates(subset=["business_id"], keep="first")
+            .sort_values("business_name", kind="stable")
+            .reset_index(drop=True)
+        )
 
-    if not all_dfs:
-        return pd.DataFrame(), pd.DataFrame(), errors
+    if not businesses_df.empty:
+        for _, business in businesses_df.iterrows():
+            business_id = str(business.get("business_id", "")).strip()
+            business_name = str(business.get("business_name", "")).strip() or f"Business {business_id}"
+            if not business_id:
+                continue
 
-    raw_accounts = pd.concat(all_dfs, ignore_index=True)
+            for edge in ("owned_ad_accounts", "client_ad_accounts"):
+                source_name = f"business/{business_id}/{edge}"
+                url = f"{BASE_URL}/{API_VERSION}/{business_id}/{edge}"
+                params = {
+                    "fields": "id,account_id,name,account_status,currency,business{id,name}",
+                    "access_token": ACCESS_TOKEN,
+                    "limit": 500,
+                }
+                try:
+                    rows = fetch_all_pages(url, params)
+                    all_rows.extend(
+                        _prepare_account_rows(
+                            rows,
+                            source_name=source_name,
+                            source_business_id=business_id,
+                            source_business_name=business_name,
+                        )
+                    )
+                except Exception as exc:
+                    message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
+                    errors.append(f"{source_name}: {message}")
 
-    # Same account inclusion logic as app_val_Final5.py.
-    if "name" in raw_accounts.columns:
-        name_match = raw_accounts["name"].apply(is_relevant_account_name)
-        okaby_source = raw_accounts["source"].apply(source_is_okaby)
-        raw_accounts = raw_accounts[name_match | okaby_source].copy()
+    if not all_rows:
+        return pd.DataFrame(), pd.DataFrame(), businesses_df, errors
 
+    raw_accounts = pd.DataFrame(all_rows)
     id_col = "id" if "id" in raw_accounts.columns else "account_id"
     if id_col not in raw_accounts.columns:
-        return pd.DataFrame(), raw_accounts.reset_index(drop=True), errors
+        return pd.DataFrame(), raw_accounts.reset_index(drop=True), businesses_df, errors
 
-    business_map = (
+    # Do not restrict accounts by hard-coded names. Unknown agent codes stay visible as Unknown.
+    business_name_map = (
         raw_accounts.groupby(id_col, dropna=False)["business_name"]
         .apply(combine_business_names)
         .to_dict()
     )
+    business_id_map = (
+        raw_accounts.groupby(id_col, dropna=False)["business_id"]
+        .apply(combine_unique_text)
+        .to_dict()
+    )
     source_map = (
         raw_accounts.groupby(id_col, dropna=False)["source"]
-        .apply(lambda values: " | ".join(sorted(set(map(str, values)))))
+        .apply(combine_unique_text)
         .to_dict()
     )
 
-    dedup = (
-        raw_accounts.sort_values(["name", "source"])
-        .drop_duplicates(subset=[id_col], keep="first")
-        .copy()
-    )
-    dedup["business_name"] = dedup[id_col].map(business_map).fillna(DIRECT_BUSINESS_NAME)
+    sort_cols = [col for col in ["name", "source"] if col in raw_accounts.columns]
+    dedup = raw_accounts.sort_values(sort_cols).drop_duplicates(subset=[id_col], keep="first").copy()
+    dedup["business_name"] = dedup[id_col].map(business_name_map).fillna(DIRECT_BUSINESS_NAME)
+    dedup["business_id"] = dedup[id_col].map(business_id_map).fillna("")
     dedup["source"] = dedup[id_col].map(source_map).fillna("")
 
-    return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True), errors
+    return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True), businesses_df, errors
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -439,8 +578,8 @@ def get_adsets_with_targeting(account_id):
     clean_id = normalize_account_id(account_id)
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/adsets"
     params = {
-        # No Insights, spend, results, gender, balance, actions or breakdowns.
-        # Only Ad Set metadata plus the targeting object that contains age_min/age_max.
+        # This endpoint pulls only Ad Set metadata and the targeting object.
+        # Minimal delivery Insights are requested separately for the Date Range filter.
         "fields": "id,name,campaign_id,status,effective_status,targeting",
         "access_token": ACCESS_TOKEN,
         "limit": 1000,
@@ -449,21 +588,97 @@ def get_adsets_with_targeting(account_id):
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_daily_adset_delivery(account_id, since_date, until_date):
+    """Minimal Insights pull used only to filter Ad Sets by delivery date."""
+    clean_id = normalize_account_id(account_id)
+    url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
+    params = {
+        "fields": "adset_id,date_start,impressions,spend",
+        "level": "adset",
+        "time_increment": 1,
+        "time_range": json.dumps(
+            {"since": str(since_date), "until": str(until_date)},
+            separators=(",", ":"),
+        ),
+        "access_token": ACCESS_TOKEN,
+        "limit": 1000,
+    }
+    rows = fetch_all_pages(url, params)
+    return pd.DataFrame(rows)
+
+
+def build_delivery_flags(delivery_df):
+    bounds = delivery_window_dates()
+    date_sets = {}
+
+    if not delivery_df.empty:
+        working = delivery_df.copy()
+        working["adset_id"] = working.get("adset_id", "").astype(str)
+        working["delivery_date"] = pd.to_datetime(
+            working.get("date_start", ""), errors="coerce"
+        ).dt.date
+        working["impressions_num"] = pd.to_numeric(
+            working.get("impressions", 0), errors="coerce"
+        ).fillna(0)
+        working["spend_num"] = pd.to_numeric(
+            working.get("spend", 0), errors="coerce"
+        ).fillna(0)
+        working = working[
+            working["delivery_date"].notna()
+            & ((working["impressions_num"] > 0) | (working["spend_num"] > 0))
+        ]
+        for adset_id, group in working.groupby("adset_id"):
+            date_sets[str(adset_id)] = set(group["delivery_date"].tolist())
+
+    flags = {}
+    for adset_id, dates in date_sets.items():
+        flags[adset_id] = {
+            "delivered_today": bounds["today"] in dates,
+            "delivered_yesterday": bounds["yesterday"] in dates,
+            "delivered_last_7d": delivered_in_range(
+                dates, bounds["last_7d_start"], bounds["today"]
+            ),
+            "delivered_this_month": delivered_in_range(
+                dates, bounds["this_month_start"], bounds["today"]
+            ),
+            "delivered_last_month": delivered_in_range(
+                dates, bounds["last_month_start"], bounds["last_month_end"]
+            ),
+        }
+    return flags
+
+
 def fetch_one_account(row):
     account_id = row.get("id") or row.get("account_id")
     account_name = row.get("name", "Unknown")
     source = row.get("source", "")
     business_name = row.get("business_name") or business_name_from_source(source)
+    business_id = row.get("business_id", "")
 
     try:
         campaigns_df = get_campaigns(account_id)
         adsets_df = get_adsets_with_targeting(account_id)
 
+        bounds = delivery_window_dates()
+        delivery_error = None
+        try:
+            delivery_df = get_daily_adset_delivery(
+                account_id,
+                bounds["query_since"],
+                bounds["query_until"],
+            )
+            delivery_flags = build_delivery_flags(delivery_df)
+        except Exception as exc:
+            delivery_flags = {}
+            message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
+            delivery_error = f"{account_name} delivery Insights: {message}"
+
         if adsets_df.empty:
             return {
                 "rows": pd.DataFrame(),
                 "account_name": account_name,
-                "error": None,
+                "error": delivery_error,
             }
 
         campaign_map = {}
@@ -490,6 +705,7 @@ def fetch_one_account(row):
 
             output_rows.append(
                 {
+                    "business_id": str(business_id),
                     "business_name": str(business_name),
                     "business_unit": detect_business_unit(
                         account_name=account_name,
@@ -514,13 +730,23 @@ def fetch_one_account(row):
                     ),
                     "min_age": format_min_age(targeting),
                     "max_age": format_max_age(targeting),
+                    **delivery_flags.get(
+                        str(adset.get("id", "")),
+                        {
+                            "delivered_today": False,
+                            "delivered_yesterday": False,
+                            "delivered_last_7d": False,
+                            "delivered_this_month": False,
+                            "delivered_last_month": False,
+                        },
+                    ),
                 }
             )
 
         return {
             "rows": pd.DataFrame(output_rows),
             "account_name": account_name,
-            "error": None,
+            "error": delivery_error,
         }
 
     except Exception as exc:
@@ -729,10 +955,10 @@ def force_clear_refresh_lock():
 snapshot = load_snapshot()
 
 st.title("Meta Ad Set Min / Max Age")
-st.caption(f"Build: {APP_BUILD} · CSV snapshots only · No to_parquet / read_parquet")
+st.caption(f"Build: {APP_BUILD} · CSV snapshots only · Dynamic Businesses")
 st.caption(
     "Same Ad Account → Agent coding as app_val_Final5.py. "
-    "This app does not request Insights, Spend, Results, Gender, Balance or Age breakdowns."
+    "The visible table contains Age Min/Max only; minimal daily Insights are used internally for the Date Range filter."
 )
 
 with st.sidebar:
@@ -769,14 +995,16 @@ if refresh_clicked:
         st.stop()
 
     try:
-        with st.status("Refreshing current Ad Set age targeting...", expanded=True) as status:
-            accounts_df, raw_accounts_df, account_discovery_errors = get_ad_accounts()
+        # A manual refresh must bypass all previous API caches immediately.
+        st.cache_data.clear()
+        with st.status("Refreshing current Ad Set age targeting and delivery dates...", expanded=True) as status:
+            accounts_df, raw_accounts_df, businesses_df, account_discovery_errors = get_ad_accounts()
             status.write(
-                f"Loaded {len(accounts_df)} relevant Ad Accounts from configured businesses."
+                f"Discovered {len(businesses_df)} Businesses and loaded {len(accounts_df)} accessible Ad Accounts."
             )
 
             if accounts_df.empty:
-                st.error("No matching El-Okaby / VAL Ad Accounts were found.")
+                st.error("No accessible Ad Accounts were found for this token.")
                 if account_discovery_errors:
                     st.code("\n".join(account_discovery_errors))
                 st.stop()
@@ -818,6 +1046,7 @@ if refresh_clicked:
                 if all_rows
                 else pd.DataFrame(
                     columns=[
+                        "business_id",
                         "business_name",
                         "business_unit",
                         "buyer_code",
@@ -832,6 +1061,11 @@ if refresh_clicked:
                         "adset_status",
                         "min_age",
                         "max_age",
+                        "delivered_today",
+                        "delivered_yesterday",
+                        "delivered_last_7d",
+                        "delivered_this_month",
+                        "delivered_last_month",
                     ]
                 )
             )
@@ -855,10 +1089,14 @@ if refresh_clicked:
                 if "id" in accounts_df.columns
                 else int(len(accounts_df)),
                 "adsets_count": int(len(age_targeting_df)),
-                "business_ids": BUSINESS_IDS,
+                "discovered_businesses_count": int(len(businesses_df)),
+                "discovered_businesses": businesses_df.to_dict("records") if not businesses_df.empty else [],
+                "extra_business_ids": EXTRA_BUSINESS_IDS,
+                "delivery_query_since": str(delivery_window_dates()["query_since"]),
+                "delivery_query_until": str(delivery_window_dates()["query_until"]),
                 "errors_count": int(len(errors)),
                 "errors": errors[:100],
-                "data_scope": "Current Ad Set targeting only; no historical Insights requested.",
+                "data_scope": "Current Age targeting plus minimal daily Ad Set delivery data for date filtering.",
             }
 
             save_snapshot_atomic(
@@ -891,10 +1129,18 @@ meta = snapshot["meta"]
 
 st.caption(
     f"Last updated: {meta.get('last_fetch_ts', '-')}"
+    f" | Businesses: {meta.get('discovered_businesses_count', 0)}"
     f" | Fetched accounts: {meta.get('accounts_count', 0)}"
     f" | Ad Sets: {meta.get('adsets_count', 0)}"
     f" | Errors: {meta.get('errors_count', 0)}"
 )
+
+snapshot_delivery_until = str(meta.get("delivery_query_until", "")).strip()
+if snapshot_delivery_until and snapshot_delivery_until != str(current_cairo_date()):
+    st.warning(
+        f"The saved delivery data ends on {snapshot_delivery_until}. "
+        "Click Refresh Age Data before using Today or the latest date ranges."
+    )
 
 # Backward compatibility for snapshots created before the Business filter existed.
 if "business_name" not in age_df.columns:
@@ -909,13 +1155,62 @@ if "business_name" not in age_df.columns:
         }
     ).fillna(DIRECT_BUSINESS_NAME)
 
+DELIVERY_COLUMNS = {
+    "Today": "delivered_today",
+    "Yesterday": "delivered_yesterday",
+    "Last 7 Days": "delivered_last_7d",
+    "This Month": "delivered_this_month",
+    "Last Month": "delivered_last_month",
+}
+
+missing_delivery_columns = [
+    column for column in DELIVERY_COLUMNS.values() if column not in age_df.columns
+]
+if missing_delivery_columns:
+    for column in missing_delivery_columns:
+        age_df[column] = "False"
+    st.warning(
+        "This snapshot was created before the Date Range feature. Click Refresh Age Data once to load delivery dates."
+    )
+
 st.subheader("Filters")
 filtered = age_df.copy()
 
+filter_title_col, date_filter_col = st.columns([3, 1])
+with filter_title_col:
+    st.caption(
+        "Date Range filters Ad Sets that had delivery in the selected period. Min/Max Age remain the current targeting settings."
+    )
+with date_filter_col:
+    selected_date_range = st.selectbox(
+        "Date Range",
+        list(DELIVERY_COLUMNS.keys()),
+        index=0,
+        key="date_range_selector",
+    )
+
+selected_delivery_column = DELIVERY_COLUMNS[selected_date_range]
+if not filtered.empty:
+    delivered_mask = (
+        filtered[selected_delivery_column]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin({"true", "1", "yes"})
+    )
+    filtered = filtered[delivered_mask].copy()
+
 top_filter_col_1, top_filter_col_2 = st.columns(2)
 business_options = (
-    sorted(filtered["business_name"].dropna().astype(str).unique().tolist())
-    if not filtered.empty
+    sorted(
+        {
+            name.strip()
+            for value in age_df["business_name"].dropna().astype(str)
+            for name in value.split("|")
+            if name.strip()
+        }
+    )
+    if not age_df.empty
     else []
 )
 with top_filter_col_1:
@@ -928,7 +1223,12 @@ with top_filter_col_1:
     )
 
 if selected_business != "All" and not filtered.empty:
-    filtered = filtered[filtered["business_name"] == selected_business].copy()
+    filtered = filtered[
+        filtered["business_name"].astype(str).apply(
+            lambda value: selected_business
+            in {item.strip() for item in value.split("|") if item.strip()}
+        )
+    ].copy()
 
 business_unit_options = (
     sorted(filtered["business_unit"].dropna().astype(str).unique().tolist())
@@ -1099,8 +1399,9 @@ st.download_button(
 )
 
 st.info(
-    "Min Age and Max Age are the current targeting settings returned by Meta for each Ad Set. "
-    "They are not historical metrics, so this lightweight version intentionally has no Today / Yesterday / date-range selector."
+    "Min Age and Max Age are the current targeting settings returned by Meta. "
+    "The Date Range controls which Ad Sets had delivery during Today, Yesterday, Last 7 Days, This Month or Last Month; "
+    "it does not reconstruct historical changes to the targeting settings."
 )
 
 if show_account_sources:
