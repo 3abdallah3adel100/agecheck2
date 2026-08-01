@@ -12,10 +12,20 @@ import streamlit as st
 
 st.set_page_config(page_title="Meta Ad Set Age Targeting", layout="wide")
 
+APP_BUILD = "2026-08-02-csv-business-filter-v2"
+
 
 # =========================================================
 # Login — same secret name used by the original application
 # =========================================================
+def get_secret(name, default=None):
+    """Read a Streamlit secret without crashing the app during startup."""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -24,10 +34,17 @@ def check_password():
         return True
 
     st.title("🔐 Login Required")
+
+    configured_password = str(get_secret("APP_PASSWORD", "")).strip()
+    if not configured_password:
+        st.error("APP_PASSWORD is missing from Streamlit Secrets.")
+        st.code('APP_PASSWORD = "YOUR_PASSWORD"', language="toml")
+        return False
+
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        if password == st.secrets["APP_PASSWORD"]:
+        if password == configured_password:
             st.session_state["password_correct"] = True
             st.rerun()
         else:
@@ -44,16 +61,27 @@ if not check_password():
 # Meta configuration — keeps the original secret names
 # =========================================================
 BASE_URL = "https://graph.facebook.com"
-API_VERSION = st.secrets.get("META_API_VERSION", "v26.0")
-ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
+API_VERSION = str(get_secret("META_API_VERSION", "v26.0")).strip() or "v26.0"
+ACCESS_TOKEN = str(get_secret("META_ACCESS_TOKEN", "")).strip()
+
+if not ACCESS_TOKEN:
+    st.error("META_ACCESS_TOKEN is missing from Streamlit Secrets.")
+    st.code('META_ACCESS_TOKEN = "YOUR_META_ACCESS_TOKEN"', language="toml")
+    st.stop()
 
 DEFAULT_BUSINESS_IDS = [
     "751488620224306",   # El - Okaby
     "1178859133269743",  # VAL
 ]
 
+BUSINESS_NAME_BY_ID = {
+    "751488620224306": "El - Okaby",
+    "1178859133269743": "VAL",
+}
+DIRECT_BUSINESS_NAME = "Direct / Assigned"
+
 try:
-    configured_business_ids = st.secrets.get("BUSINESS_IDS", DEFAULT_BUSINESS_IDS)
+    configured_business_ids = get_secret("BUSINESS_IDS", DEFAULT_BUSINESS_IDS)
     if isinstance(configured_business_ids, str):
         BUSINESS_IDS = [
             value.strip()
@@ -74,15 +102,15 @@ REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
 DATA_DIR = Path("app_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.parquet"
-ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.parquet"
-RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.parquet"
+AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.csv"
+ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.csv"
+RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.csv"
 META_FILE = DATA_DIR / "age_targeting_meta_snapshot.json"
 LOCK_FILE = DATA_DIR / "age_targeting_refresh.lock"
 
-TMP_AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.tmp.parquet"
-TMP_ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.tmp.parquet"
-TMP_RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.tmp.parquet"
+TMP_AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.tmp.csv"
+TMP_ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.tmp.csv"
+TMP_RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.tmp.csv"
 TMP_META_FILE = DATA_DIR / "age_targeting_meta_snapshot.tmp.json"
 
 
@@ -141,6 +169,27 @@ def source_is_okaby(source: str) -> bool:
     return "751488620224306" in str(source)
 
 
+def business_name_from_source(source: str) -> str:
+    source_text = str(source)
+    for business_id, business_name in BUSINESS_NAME_BY_ID.items():
+        if business_id in source_text:
+            return business_name
+    return DIRECT_BUSINESS_NAME
+
+
+def combine_business_names(values) -> str:
+    names = []
+    for value in values:
+        name = str(value).strip()
+        if name and name not in names:
+            names.append(name)
+
+    specific_names = [name for name in names if name != DIRECT_BUSINESS_NAME]
+    if specific_names:
+        return " | ".join(specific_names)
+    return DIRECT_BUSINESS_NAME
+
+
 def detect_business_unit(account_name="", campaign_name="", source=""):
     acc = normalize_text(account_name)
     camp = normalize_text(campaign_name)
@@ -194,6 +243,7 @@ def adset_status_label(status=None, effective_status=None):
 
 
 def format_min_age(targeting):
+    """Always return text so Parquet never receives mixed int/string values."""
     if not isinstance(targeting, dict):
         return "Not returned"
 
@@ -202,12 +252,13 @@ def format_min_age(targeting):
         return "Not returned"
 
     try:
-        return int(value)
+        return str(int(value))
     except (TypeError, ValueError):
         return str(value)
 
 
 def format_max_age(targeting):
+    """Always return text so values such as 64 and 65+ share one data type."""
     if not isinstance(targeting, dict):
         return "Not returned"
 
@@ -217,7 +268,7 @@ def format_max_age(targeting):
 
     try:
         numeric = int(value)
-        return "65+" if numeric >= 65 else numeric
+        return "65+" if numeric >= 65 else str(numeric)
     except (TypeError, ValueError):
         return str(value)
 
@@ -289,24 +340,34 @@ def get_ad_accounts():
     errors = []
 
     sources = [
-        ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
+        (
+            "me/adaccounts",
+            f"{BASE_URL}/{API_VERSION}/me/adaccounts",
+            DIRECT_BUSINESS_NAME,
+        ),
     ]
 
     for business_id in BUSINESS_IDS:
+        business_name = BUSINESS_NAME_BY_ID.get(
+            str(business_id),
+            f"Business {business_id}",
+        )
         sources.extend(
             [
                 (
                     f"business/{business_id}/owned_ad_accounts",
                     f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts",
+                    business_name,
                 ),
                 (
                     f"business/{business_id}/client_ad_accounts",
                     f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts",
+                    business_name,
                 ),
             ]
         )
 
-    for source_name, url in sources:
+    for source_name, url, business_name in sources:
         try:
             params = {
                 "fields": "id,account_id,name,account_status,currency",
@@ -317,6 +378,7 @@ def get_ad_accounts():
             df = pd.DataFrame(rows)
             if not df.empty:
                 df["source"] = source_name
+                df["business_name"] = business_name
                 all_dfs.append(df)
         except Exception as exc:
             message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
@@ -333,17 +395,28 @@ def get_ad_accounts():
         okaby_source = raw_accounts["source"].apply(source_is_okaby)
         raw_accounts = raw_accounts[name_match | okaby_source].copy()
 
-    dedup = raw_accounts.copy()
-    if "id" in dedup.columns:
-        dedup = (
-            dedup.sort_values(["name", "source"])
-            .drop_duplicates(subset=["id"], keep="first")
-        )
-    elif "account_id" in dedup.columns:
-        dedup = (
-            dedup.sort_values(["name", "source"])
-            .drop_duplicates(subset=["account_id"], keep="first")
-        )
+    id_col = "id" if "id" in raw_accounts.columns else "account_id"
+    if id_col not in raw_accounts.columns:
+        return pd.DataFrame(), raw_accounts.reset_index(drop=True), errors
+
+    business_map = (
+        raw_accounts.groupby(id_col, dropna=False)["business_name"]
+        .apply(combine_business_names)
+        .to_dict()
+    )
+    source_map = (
+        raw_accounts.groupby(id_col, dropna=False)["source"]
+        .apply(lambda values: " | ".join(sorted(set(map(str, values)))))
+        .to_dict()
+    )
+
+    dedup = (
+        raw_accounts.sort_values(["name", "source"])
+        .drop_duplicates(subset=[id_col], keep="first")
+        .copy()
+    )
+    dedup["business_name"] = dedup[id_col].map(business_map).fillna(DIRECT_BUSINESS_NAME)
+    dedup["source"] = dedup[id_col].map(source_map).fillna("")
 
     return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True), errors
 
@@ -380,6 +453,7 @@ def fetch_one_account(row):
     account_id = row.get("id") or row.get("account_id")
     account_name = row.get("name", "Unknown")
     source = row.get("source", "")
+    business_name = row.get("business_name") or business_name_from_source(source)
 
     try:
         campaigns_df = get_campaigns(account_id)
@@ -416,6 +490,7 @@ def fetch_one_account(row):
 
             output_rows.append(
                 {
+                    "business_name": str(business_name),
                     "business_unit": detect_business_unit(
                         account_name=account_name,
                         campaign_name=campaign_name,
@@ -464,10 +539,16 @@ def snapshot_exists():
     return AGE_TARGETING_FILE.exists() and META_FILE.exists()
 
 
-def safe_read_parquet(path):
+def safe_read_csv(path):
+    """Read snapshots as text so values such as 65+ can never be inferred as integers."""
     try:
         if path.exists():
-            return pd.read_parquet(path)
+            return pd.read_csv(
+                path,
+                dtype=str,
+                keep_default_na=False,
+                encoding="utf-8",
+            )
     except Exception:
         try:
             path.unlink(missing_ok=True)
@@ -487,26 +568,85 @@ def load_snapshot():
         return None
 
     return {
-        "age_targeting": safe_read_parquet(AGE_TARGETING_FILE),
-        "accounts": safe_read_parquet(ACCOUNTS_FILE),
-        "raw_accounts": safe_read_parquet(RAW_ACCOUNTS_FILE),
+        "age_targeting": safe_read_csv(AGE_TARGETING_FILE),
+        "accounts": safe_read_csv(ACCOUNTS_FILE),
+        "raw_accounts": safe_read_csv(RAW_ACCOUNTS_FILE),
         "meta": meta,
     }
 
 
+def _snapshot_scalar(value):
+    """Convert nested/mixed values to stable CSV-safe text."""
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    return str(value)
+
+
+def csv_safe_dataframe(dataframe):
+    """Return an all-text copy; CSV does not require Arrow or a fixed numeric schema."""
+    safe_df = dataframe.copy()
+    for column in safe_df.columns:
+        safe_df[column] = safe_df[column].map(_snapshot_scalar)
+    return safe_df
+
+
 def save_snapshot_atomic(age_targeting_df, accounts_df, raw_accounts_df, meta):
-    age_targeting_df.to_parquet(TMP_AGE_TARGETING_FILE, index=False)
-    accounts_df.to_parquet(TMP_ACCOUNTS_FILE, index=False)
-    raw_accounts_df.to_parquet(TMP_RAW_ACCOUNTS_FILE, index=False)
+    """Save atomically using CSV, avoiding pyarrow/parquet completely."""
+    safe_age_targeting_df = csv_safe_dataframe(age_targeting_df)
+    safe_accounts_df = csv_safe_dataframe(accounts_df)
+    safe_raw_accounts_df = csv_safe_dataframe(raw_accounts_df)
 
-    with open(TMP_META_FILE, "w", encoding="utf-8") as file:
-        json.dump(meta, file, ensure_ascii=False, indent=2)
+    temp_files = [
+        TMP_AGE_TARGETING_FILE,
+        TMP_ACCOUNTS_FILE,
+        TMP_RAW_ACCOUNTS_FILE,
+        TMP_META_FILE,
+    ]
 
-    os.replace(TMP_AGE_TARGETING_FILE, AGE_TARGETING_FILE)
-    os.replace(TMP_ACCOUNTS_FILE, ACCOUNTS_FILE)
-    os.replace(TMP_RAW_ACCOUNTS_FILE, RAW_ACCOUNTS_FILE)
-    os.replace(TMP_META_FILE, META_FILE)
+    try:
+        safe_age_targeting_df.to_csv(
+            TMP_AGE_TARGETING_FILE,
+            index=False,
+            encoding="utf-8",
+        )
+        safe_accounts_df.to_csv(
+            TMP_ACCOUNTS_FILE,
+            index=False,
+            encoding="utf-8",
+        )
+        safe_raw_accounts_df.to_csv(
+            TMP_RAW_ACCOUNTS_FILE,
+            index=False,
+            encoding="utf-8",
+        )
 
+        with open(TMP_META_FILE, "w", encoding="utf-8") as file:
+            json.dump(meta, file, ensure_ascii=False, indent=2)
+
+        os.replace(TMP_AGE_TARGETING_FILE, AGE_TARGETING_FILE)
+        os.replace(TMP_ACCOUNTS_FILE, ACCOUNTS_FILE)
+        os.replace(TMP_RAW_ACCOUNTS_FILE, RAW_ACCOUNTS_FILE)
+        os.replace(TMP_META_FILE, META_FILE)
+    except Exception as exc:
+        for temp_file in temp_files:
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise RuntimeError(
+            "Could not save the local CSV snapshot. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        ) from exc
 
 def build_account_sources_table(raw_accounts):
     if raw_accounts.empty:
@@ -589,6 +729,7 @@ def force_clear_refresh_lock():
 snapshot = load_snapshot()
 
 st.title("Meta Ad Set Min / Max Age")
+st.caption(f"Build: {APP_BUILD} · CSV snapshots only · No to_parquet / read_parquet")
 st.caption(
     "Same Ad Account → Agent coding as app_val_Final5.py. "
     "This app does not request Insights, Spend, Results, Gender, Balance or Age breakdowns."
@@ -677,6 +818,7 @@ if refresh_clicked:
                 if all_rows
                 else pd.DataFrame(
                     columns=[
+                        "business_name",
                         "business_unit",
                         "buyer_code",
                         "media_buyer",
@@ -697,6 +839,7 @@ if refresh_clicked:
             if not age_targeting_df.empty:
                 age_targeting_df = age_targeting_df.sort_values(
                     [
+                        "business_name",
                         "business_unit",
                         "media_buyer",
                         "account_name",
@@ -731,7 +874,7 @@ if refresh_clicked:
 
     except Exception as exc:
         st.error(f"Refresh failed: {exc}")
-        raise
+        st.info("The app is still running. Fix the reported issue, then click Refresh Age Data again.")
     finally:
         release_refresh_lock()
 
@@ -753,19 +896,53 @@ st.caption(
     f" | Errors: {meta.get('errors_count', 0)}"
 )
 
-# Business Unit remains on the upper right, like the original dashboard.
-left_title_col, right_filter_col = st.columns([3, 1])
-with left_title_col:
-    st.subheader("Filters")
-with right_filter_col:
+# Backward compatibility for snapshots created before the Business filter existed.
+if "business_name" not in age_df.columns:
+    age_df["business_name"] = age_df.get(
+        "business_unit",
+        pd.Series("Unknown", index=age_df.index),
+    ).map(
+        {
+            "El - Okaby": "El - Okaby",
+            "Val Hair": "VAL",
+            "VAL Booty": "VAL",
+        }
+    ).fillna(DIRECT_BUSINESS_NAME)
+
+st.subheader("Filters")
+filtered = age_df.copy()
+
+top_filter_col_1, top_filter_col_2 = st.columns(2)
+business_options = (
+    sorted(filtered["business_name"].dropna().astype(str).unique().tolist())
+    if not filtered.empty
+    else []
+)
+with top_filter_col_1:
+    selected_business = st.selectbox(
+        "Business",
+        ["All"] + business_options,
+        index=0,
+        key="business_selector",
+        help="اختار El - Okaby أو VAL لعرض الحسابات التابعة للبيزنس فقط.",
+    )
+
+if selected_business != "All" and not filtered.empty:
+    filtered = filtered[filtered["business_name"] == selected_business].copy()
+
+business_unit_options = (
+    sorted(filtered["business_unit"].dropna().astype(str).unique().tolist())
+    if not filtered.empty
+    else []
+)
+with top_filter_col_2:
     selected_business_unit = st.selectbox(
         "Business Unit",
-        ["El - Okaby", "Val Hair", "VAL Booty", "All"],
+        ["All"] + business_unit_options,
         index=0,
         key="business_unit_selector",
     )
 
-filtered = age_df.copy()
 if selected_business_unit != "All" and not filtered.empty:
     filtered = filtered[filtered["business_unit"] == selected_business_unit].copy()
 
@@ -801,22 +978,26 @@ with filter_col_2:
 if selected_account != "All" and not filtered.empty:
     filtered = filtered[filtered["account_name"] == selected_account].copy()
 
-campaign_status_options = (
-    sorted(filtered["campaign_status"].dropna().astype(str).unique().tolist())
-    if not filtered.empty
-    else []
-)
 with filter_col_3:
-    selected_campaign_status = st.selectbox(
-        "Campaign Status",
-        ["All"] + campaign_status_options,
+    selected_campaign_filter = st.selectbox(
+        "Campaign Filter",
+        [
+            "Active Campaigns",
+            "All Campaigns",
+            "Not Active Campaigns",
+        ],
         index=0,
+        help=(
+            "Active Campaigns يعرض الكامبينات التي ترجعها Meta بحالة "
+            "effective_status = ACTIVE فقط."
+        ),
     )
 
-if selected_campaign_status != "All" and not filtered.empty:
-    filtered = filtered[
-        filtered["campaign_status"] == selected_campaign_status
-    ].copy()
+if not filtered.empty:
+    if selected_campaign_filter == "Active Campaigns":
+        filtered = filtered[filtered["campaign_status"] == "Active"].copy()
+    elif selected_campaign_filter == "Not Active Campaigns":
+        filtered = filtered[filtered["campaign_status"] != "Active"].copy()
 
 adset_status_options = (
     sorted(filtered["adset_status"].dropna().astype(str).unique().tolist())
@@ -896,6 +1077,10 @@ display_df = filtered.rename(
     ]
 ].reset_index(drop=True)
 
+# Streamlit also serializes displayed DataFrames through Arrow internally.
+# Keeping every visible column as text prevents 65+ from ever being inferred as int64.
+display_df = csv_safe_dataframe(display_df)
+
 st.dataframe(
     display_df,
     use_container_width=True,
@@ -923,7 +1108,11 @@ if show_account_sources:
         if raw_accounts_df.empty:
             st.info("No source details in the saved snapshot.")
         else:
-            st.dataframe(raw_accounts_df, use_container_width=True, hide_index=True)
+            st.dataframe(
+                csv_safe_dataframe(raw_accounts_df),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 errors = meta.get("errors", [])
 if errors:
