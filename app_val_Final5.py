@@ -12,9 +12,9 @@ import requests
 import streamlit as st
 
 
-st.set_page_config(page_title="Meta Ad Set Age Targeting", layout="wide")
+st.set_page_config(page_title="Meta Age Spend Breakdown", layout="wide")
 
-APP_BUILD = "2026-08-02-dynamic-business-date-filter-v3"
+APP_BUILD = "2026-08-27-age-spend-breakdown-v1"
 
 
 # =========================================================
@@ -589,13 +589,14 @@ def get_adsets_with_targeting(account_id):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_daily_adset_delivery(account_id, since_date, until_date):
-    """Minimal Insights pull used only to filter Ad Sets by delivery date."""
+def get_daily_adset_age_spend(account_id, since_date, until_date):
+    """Daily Meta Insights split by standard Meta age buckets for every Ad Set."""
     clean_id = normalize_account_id(account_id)
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
     params = {
         "fields": "adset_id,date_start,impressions,spend",
         "level": "adset",
+        "breakdowns": "age",
         "time_increment": 1,
         "time_range": json.dumps(
             {"since": str(since_date), "until": str(until_date)},
@@ -608,45 +609,93 @@ def get_daily_adset_delivery(account_id, since_date, until_date):
     return pd.DataFrame(rows)
 
 
-def build_delivery_flags(delivery_df):
+def build_age_spend_rows(age_spend_df):
+    """Aggregate daily age-breakdown Insights into the UI date windows."""
     bounds = delivery_window_dates()
-    date_sets = {}
+    output = {}
 
-    if not delivery_df.empty:
-        working = delivery_df.copy()
-        working["adset_id"] = working.get("adset_id", "").astype(str)
-        working["delivery_date"] = pd.to_datetime(
-            working.get("date_start", ""), errors="coerce"
-        ).dt.date
-        working["impressions_num"] = pd.to_numeric(
-            working.get("impressions", 0), errors="coerce"
-        ).fillna(0)
-        working["spend_num"] = pd.to_numeric(
-            working.get("spend", 0), errors="coerce"
-        ).fillna(0)
-        working = working[
-            working["delivery_date"].notna()
-            & ((working["impressions_num"] > 0) | (working["spend_num"] > 0))
-        ]
-        for adset_id, group in working.groupby("adset_id"):
-            date_sets[str(adset_id)] = set(group["delivery_date"].tolist())
+    if age_spend_df.empty:
+        return output
 
-    flags = {}
-    for adset_id, dates in date_sets.items():
-        flags[adset_id] = {
-            "delivered_today": bounds["today"] in dates,
-            "delivered_yesterday": bounds["yesterday"] in dates,
-            "delivered_last_7d": delivered_in_range(
-                dates, bounds["last_7d_start"], bounds["today"]
-            ),
-            "delivered_this_month": delivered_in_range(
-                dates, bounds["this_month_start"], bounds["today"]
-            ),
-            "delivered_last_month": delivered_in_range(
-                dates, bounds["last_month_start"], bounds["last_month_end"]
-            ),
-        }
-    return flags
+    working = age_spend_df.copy()
+    if "adset_id" not in working.columns:
+        return output
+    working["adset_id"] = working["adset_id"].fillna("").astype(str)
+    if "age" not in working.columns:
+        working["age"] = "Unknown"
+    else:
+        working["age"] = working["age"].fillna("Unknown").astype(str)
+    working["delivery_date"] = pd.to_datetime(
+        working.get("date_start", ""), errors="coerce"
+    ).dt.date
+    working["impressions_num"] = pd.to_numeric(
+        working.get("impressions", 0), errors="coerce"
+    ).fillna(0)
+    working["spend_num"] = pd.to_numeric(
+        working.get("spend", 0), errors="coerce"
+    ).fillna(0.0)
+
+    working = working[
+        working["delivery_date"].notna()
+        & working["adset_id"].ne("")
+        & working["age"].ne("")
+    ].copy()
+
+    def period_sum(group, start_date, end_date):
+        mask = group["delivery_date"].between(start_date, end_date)
+        return float(group.loc[mask, "spend_num"].sum())
+
+    def period_delivered(group, start_date, end_date):
+        mask = group["delivery_date"].between(start_date, end_date)
+        period = group.loc[mask]
+        return bool(
+            ((period["impressions_num"] > 0) | (period["spend_num"] > 0)).any()
+        )
+
+    for (adset_id, age_bucket), group in working.groupby(
+        ["adset_id", "age"], dropna=False
+    ):
+        today_spend = period_sum(group, bounds["today"], bounds["today"])
+        yesterday_spend = period_sum(
+            group, bounds["yesterday"], bounds["yesterday"]
+        )
+        last_7d_spend = period_sum(
+            group, bounds["last_7d_start"], bounds["today"]
+        )
+        this_month_spend = period_sum(
+            group, bounds["this_month_start"], bounds["today"]
+        )
+        last_month_spend = period_sum(
+            group, bounds["last_month_start"], bounds["last_month_end"]
+        )
+
+        output.setdefault(str(adset_id), []).append(
+            {
+                "age_bucket": str(age_bucket),
+                "spend_today": today_spend,
+                "spend_yesterday": yesterday_spend,
+                "spend_last_7d": last_7d_spend,
+                "spend_this_month": this_month_spend,
+                "spend_last_month": last_month_spend,
+                "delivered_today": period_delivered(
+                    group, bounds["today"], bounds["today"]
+                ),
+                "delivered_yesterday": period_delivered(
+                    group, bounds["yesterday"], bounds["yesterday"]
+                ),
+                "delivered_last_7d": period_delivered(
+                    group, bounds["last_7d_start"], bounds["today"]
+                ),
+                "delivered_this_month": period_delivered(
+                    group, bounds["this_month_start"], bounds["today"]
+                ),
+                "delivered_last_month": period_delivered(
+                    group, bounds["last_month_start"], bounds["last_month_end"]
+                ),
+            }
+        )
+
+    return output
 
 
 def fetch_one_account(row):
@@ -655,6 +704,7 @@ def fetch_one_account(row):
     source = row.get("source", "")
     business_name = row.get("business_name") or business_name_from_source(source)
     business_id = row.get("business_id", "")
+    account_currency = str(row.get("currency", "") or "")
 
     try:
         campaigns_df = get_campaigns(account_id)
@@ -663,16 +713,16 @@ def fetch_one_account(row):
         bounds = delivery_window_dates()
         delivery_error = None
         try:
-            delivery_df = get_daily_adset_delivery(
+            age_spend_df = get_daily_adset_age_spend(
                 account_id,
                 bounds["query_since"],
                 bounds["query_until"],
             )
-            delivery_flags = build_delivery_flags(delivery_df)
+            age_spend_by_adset = build_age_spend_rows(age_spend_df)
         except Exception as exc:
-            delivery_flags = {}
+            age_spend_by_adset = {}
             message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
-            delivery_error = f"{account_name} delivery Insights: {message}"
+            delivery_error = f"{account_name} age Spend Insights: {message}"
 
         if adsets_df.empty:
             return {
@@ -703,45 +753,43 @@ def fetch_one_account(row):
             if not isinstance(targeting, dict):
                 targeting = {}
 
-            output_rows.append(
-                {
-                    "business_id": str(business_id),
-                    "business_name": str(business_name),
-                    "business_unit": detect_business_unit(
-                        account_name=account_name,
-                        campaign_name=campaign_name,
-                        source=source,
-                    ),
-                    "buyer_code": buyer_code,
-                    "media_buyer": media_buyer,
-                    "account_id": str(account_id),
-                    "account_name": account_name,
-                    "campaign_id": campaign_id,
-                    "campaign_name": campaign_name,
-                    "campaign_status": campaign_status_label(
-                        campaign.get("status"),
-                        campaign.get("effective_status"),
-                    ),
-                    "adset_id": str(adset.get("id", "")),
-                    "adset_name": adset.get("name", "Unknown Ad Set"),
-                    "adset_status": adset_status_label(
-                        adset.get("status"),
-                        adset.get("effective_status"),
-                    ),
-                    "min_age": format_min_age(targeting),
-                    "max_age": format_max_age(targeting),
-                    **delivery_flags.get(
-                        str(adset.get("id", "")),
-                        {
-                            "delivered_today": False,
-                            "delivered_yesterday": False,
-                            "delivered_last_7d": False,
-                            "delivered_this_month": False,
-                            "delivered_last_month": False,
-                        },
-                    ),
-                }
-            )
+            adset_id = str(adset.get("id", ""))
+            age_rows = age_spend_by_adset.get(adset_id, [])
+
+            # One output row per Meta age bucket, so Spend can be filtered/summed
+            # independently for 18-24, 25-34, 35-44, 45-54, 55-64, 65+, etc.
+            for age_metrics in age_rows:
+                output_rows.append(
+                    {
+                        "business_id": str(business_id),
+                        "business_name": str(business_name),
+                        "business_unit": detect_business_unit(
+                            account_name=account_name,
+                            campaign_name=campaign_name,
+                            source=source,
+                        ),
+                        "buyer_code": buyer_code,
+                        "media_buyer": media_buyer,
+                        "account_id": str(account_id),
+                        "account_name": account_name,
+                        "account_currency": account_currency,
+                        "campaign_id": campaign_id,
+                        "campaign_name": campaign_name,
+                        "campaign_status": campaign_status_label(
+                            campaign.get("status"),
+                            campaign.get("effective_status"),
+                        ),
+                        "adset_id": adset_id,
+                        "adset_name": adset.get("name", "Unknown Ad Set"),
+                        "adset_status": adset_status_label(
+                            adset.get("status"),
+                            adset.get("effective_status"),
+                        ),
+                        "min_age": format_min_age(targeting),
+                        "max_age": format_max_age(targeting),
+                        **age_metrics,
+                    }
+                )
 
         return {
             "rows": pd.DataFrame(output_rows),
@@ -954,11 +1002,11 @@ def force_clear_refresh_lock():
 # =========================================================
 snapshot = load_snapshot()
 
-st.title("Meta Ad Set Min / Max Age")
+st.title("Meta Spend by Age")
 st.caption(f"Build: {APP_BUILD} · CSV snapshots only · Dynamic Businesses")
 st.caption(
     "Same Ad Account → Agent coding as app_val_Final5.py. "
-    "The visible table contains Age Min/Max only; minimal daily Insights are used internally for the Date Range filter."
+    "Meta Insights are pulled daily with breakdowns=age, then Spend is aggregated for the selected Date Range."
 )
 
 with st.sidebar:
@@ -997,7 +1045,7 @@ if refresh_clicked:
     try:
         # A manual refresh must bypass all previous API caches immediately.
         st.cache_data.clear()
-        with st.status("Refreshing current Ad Set age targeting and delivery dates...", expanded=True) as status:
+        with st.status("Refreshing Ad Set age Spend breakdowns...", expanded=True) as status:
             accounts_df, raw_accounts_df, businesses_df, account_discovery_errors = get_ad_accounts()
             status.write(
                 f"Discovered {len(businesses_df)} Businesses and loaded {len(accounts_df)} accessible Ad Accounts."
@@ -1053,6 +1101,7 @@ if refresh_clicked:
                         "media_buyer",
                         "account_id",
                         "account_name",
+                        "account_currency",
                         "campaign_id",
                         "campaign_name",
                         "campaign_status",
@@ -1061,6 +1110,12 @@ if refresh_clicked:
                         "adset_status",
                         "min_age",
                         "max_age",
+                        "age_bucket",
+                        "spend_today",
+                        "spend_yesterday",
+                        "spend_last_7d",
+                        "spend_this_month",
+                        "spend_last_month",
                         "delivered_today",
                         "delivered_yesterday",
                         "delivered_last_7d",
@@ -1079,6 +1134,7 @@ if refresh_clicked:
                         "account_name",
                         "campaign_name",
                         "adset_name",
+                        "age_bucket",
                     ],
                     kind="stable",
                 ).reset_index(drop=True)
@@ -1088,7 +1144,10 @@ if refresh_clicked:
                 "accounts_count": int(accounts_df["id"].nunique())
                 if "id" in accounts_df.columns
                 else int(len(accounts_df)),
-                "adsets_count": int(len(age_targeting_df)),
+                "adsets_count": int(age_targeting_df["adset_id"].nunique())
+                if "adset_id" in age_targeting_df.columns
+                else 0,
+                "age_spend_rows_count": int(len(age_targeting_df)),
                 "discovered_businesses_count": int(len(businesses_df)),
                 "discovered_businesses": businesses_df.to_dict("records") if not businesses_df.empty else [],
                 "extra_business_ids": EXTRA_BUSINESS_IDS,
@@ -1096,7 +1155,7 @@ if refresh_clicked:
                 "delivery_query_until": str(delivery_window_dates()["query_until"]),
                 "errors_count": int(len(errors)),
                 "errors": errors[:100],
-                "data_scope": "Current Age targeting plus minimal daily Ad Set delivery data for date filtering.",
+                "data_scope": "Daily Ad Set Insights with breakdowns=age, aggregated into selectable Spend date windows.",
             }
 
             save_snapshot_atomic(
@@ -1107,7 +1166,7 @@ if refresh_clicked:
             )
 
             st.cache_data.clear()
-            status.update(label="Refresh complete. New age snapshot saved.", state="complete")
+            status.update(label="Refresh complete. New age Spend snapshot saved.", state="complete")
             st.rerun()
 
     except Exception as exc:
@@ -1132,13 +1191,14 @@ st.caption(
     f" | Businesses: {meta.get('discovered_businesses_count', 0)}"
     f" | Fetched accounts: {meta.get('accounts_count', 0)}"
     f" | Ad Sets: {meta.get('adsets_count', 0)}"
+    f" | Age rows: {meta.get('age_spend_rows_count', 0)}"
     f" | Errors: {meta.get('errors_count', 0)}"
 )
 
 snapshot_delivery_until = str(meta.get("delivery_query_until", "")).strip()
 if snapshot_delivery_until and snapshot_delivery_until != str(current_cairo_date()):
     st.warning(
-        f"The saved delivery data ends on {snapshot_delivery_until}. "
+        f"The saved age Spend data ends on {snapshot_delivery_until}. "
         "Click Refresh Age Data before using Today or the latest date ranges."
     )
 
@@ -1163,14 +1223,37 @@ DELIVERY_COLUMNS = {
     "Last Month": "delivered_last_month",
 }
 
-missing_delivery_columns = [
-    column for column in DELIVERY_COLUMNS.values() if column not in age_df.columns
+SPEND_COLUMNS = {
+    "Today": "spend_today",
+    "Yesterday": "spend_yesterday",
+    "Last 7 Days": "spend_last_7d",
+    "This Month": "spend_this_month",
+    "Last Month": "spend_last_month",
+}
+
+missing_age_spend_columns = [
+    column
+    for column in list(DELIVERY_COLUMNS.values()) + list(SPEND_COLUMNS.values())
+    if column not in age_df.columns
 ]
-if missing_delivery_columns:
-    for column in missing_delivery_columns:
-        age_df[column] = "False"
+if "age_bucket" not in age_df.columns:
+    missing_age_spend_columns.append("age_bucket")
+
+if "account_currency" not in age_df.columns:
+    age_df["account_currency"] = ""
+
+if missing_age_spend_columns:
+    for column in DELIVERY_COLUMNS.values():
+        if column not in age_df.columns:
+            age_df[column] = "False"
+    for column in SPEND_COLUMNS.values():
+        if column not in age_df.columns:
+            age_df[column] = "0"
+    if "age_bucket" not in age_df.columns:
+        age_df["age_bucket"] = ""
     st.warning(
-        "This snapshot was created before the Date Range feature. Click Refresh Age Data once to load delivery dates."
+        "The saved snapshot does not contain Spend by Age yet. "
+        "Click Refresh Age Data once after deploying this version."
     )
 
 st.subheader("Filters")
@@ -1179,7 +1262,8 @@ filtered = age_df.copy()
 filter_title_col, date_filter_col = st.columns([3, 1])
 with filter_title_col:
     st.caption(
-        "Date Range filters Ad Sets that had delivery in the selected period. Min/Max Age remain the current targeting settings."
+        "Date Range changes the Spend period. Each row represents a Meta age bucket "
+        "inside an Ad Set, not only the Ad Set targeting Min/Max."
     )
 with date_filter_col:
     selected_date_range = st.selectbox(
@@ -1190,6 +1274,8 @@ with date_filter_col:
     )
 
 selected_delivery_column = DELIVERY_COLUMNS[selected_date_range]
+selected_spend_column = SPEND_COLUMNS[selected_date_range]
+
 if not filtered.empty:
     delivered_mask = (
         filtered[selected_delivery_column]
@@ -1199,6 +1285,11 @@ if not filtered.empty:
         .isin({"true", "1", "yes"})
     )
     filtered = filtered[delivered_mask].copy()
+    filtered["selected_spend"] = pd.to_numeric(
+        filtered[selected_spend_column], errors="coerce"
+    ).fillna(0.0)
+else:
+    filtered["selected_spend"] = pd.Series(dtype=float)
 
 top_filter_col_1, top_filter_col_2 = st.columns(2)
 business_options = (
@@ -1314,7 +1405,7 @@ with filter_col_4:
 if selected_adset_status != "All" and not filtered.empty:
     filtered = filtered[filtered["adset_status"] == selected_adset_status].copy()
 
-search_col_1, search_col_2 = st.columns(2)
+search_col_1, search_col_2, age_filter_col = st.columns([2, 2, 1])
 with search_col_1:
     campaign_search = st.text_input(
         "Search Campaign",
@@ -1325,6 +1416,32 @@ with search_col_2:
         "Search Ad Set",
         placeholder="Type part of the Ad Set name...",
     ).strip()
+
+AGE_ORDER = {
+    "13-17": 0,
+    "18-24": 1,
+    "25-34": 2,
+    "35-44": 3,
+    "45-54": 4,
+    "55-64": 5,
+    "65+": 6,
+    "Unknown": 99,
+}
+
+age_options = (
+    sorted(
+        filtered["age_bucket"].dropna().astype(str).unique().tolist(),
+        key=lambda value: (AGE_ORDER.get(value, 90), value),
+    )
+    if not filtered.empty
+    else []
+)
+with age_filter_col:
+    selected_age = st.selectbox(
+        "Age",
+        ["All"] + age_options,
+        index=0,
+    )
 
 if campaign_search and not filtered.empty:
     filtered = filtered[
@@ -1344,7 +1461,10 @@ if adset_search and not filtered.empty:
         )
     ].copy()
 
-metric_1, metric_2, metric_3 = st.columns(3)
+if selected_age != "All" and not filtered.empty:
+    filtered = filtered[filtered["age_bucket"].astype(str) == selected_age].copy()
+
+metric_1, metric_2, metric_3, metric_4 = st.columns(4)
 metric_1.metric(
     "Filtered Ad Accounts",
     int(filtered["account_id"].nunique()) if not filtered.empty else 0,
@@ -1353,56 +1473,127 @@ metric_2.metric(
     "Filtered Campaigns",
     int(filtered["campaign_id"].nunique()) if not filtered.empty else 0,
 )
-metric_3.metric("Filtered Ad Sets", int(len(filtered)))
+metric_3.metric(
+    "Filtered Ad Sets",
+    int(filtered["adset_id"].nunique()) if not filtered.empty else 0,
+)
+metric_4.metric(
+    "Age Buckets",
+    int(filtered["age_bucket"].nunique()) if not filtered.empty else 0,
+)
 
 st.divider()
-st.subheader("Ad Set Age Targeting")
+st.subheader(f"Spend by Age — {selected_date_range}")
 
-# Exactly the requested output columns.
+if filtered.empty:
+    st.info("No age Spend data matches the selected filters.")
+    age_summary = pd.DataFrame(columns=["Age", "Spend", "Currency"])
+else:
+    summary_working = filtered.copy()
+    summary_working["account_currency"] = (
+        summary_working["account_currency"].fillna("").astype(str)
+    )
+    age_summary = (
+        summary_working.groupby(
+            ["age_bucket", "account_currency"],
+            dropna=False,
+            as_index=False,
+        )["selected_spend"]
+        .sum()
+        .rename(
+            columns={
+                "age_bucket": "Age",
+                "account_currency": "Currency",
+                "selected_spend": "Spend",
+            }
+        )
+    )
+    age_summary["_age_order"] = age_summary["Age"].map(AGE_ORDER).fillna(90)
+    age_summary = (
+        age_summary.sort_values(
+            ["_age_order", "Age", "Currency"],
+            kind="stable",
+        )
+        .drop(columns=["_age_order"])
+        .reset_index(drop=True)
+    )
+
+st.dataframe(
+    age_summary,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Spend": st.column_config.NumberColumn(format="%.2f"),
+    },
+)
+
+st.subheader("Ad Set Age Spend Details")
+
 display_df = filtered.rename(
     columns={
         "account_name": "Ad Account Name",
         "campaign_name": "Campaign Name",
         "adset_name": "Ad Set Name",
-        "min_age": "Min Age",
-        "max_age": "Max Age",
+        "age_bucket": "Age",
+        "account_currency": "Currency",
+        "selected_spend": "Spend",
     }
 )[
     [
         "Ad Account Name",
         "Campaign Name",
         "Ad Set Name",
-        "Min Age",
-        "Max Age",
+        "Age",
+        "Spend",
+        "Currency",
     ]
-].reset_index(drop=True)
+].copy() if not filtered.empty else pd.DataFrame(
+    columns=[
+        "Ad Account Name",
+        "Campaign Name",
+        "Ad Set Name",
+        "Age",
+        "Spend",
+        "Currency",
+    ]
+)
 
-# Streamlit also serializes displayed DataFrames through Arrow internally.
-# Keeping every visible column as text prevents 65+ from ever being inferred as int64.
-display_df = csv_safe_dataframe(display_df)
+if not display_df.empty:
+    display_df["_age_order"] = display_df["Age"].map(AGE_ORDER).fillna(90)
+    display_df = (
+        display_df.sort_values(
+            ["Ad Account Name", "Campaign Name", "Ad Set Name", "_age_order", "Age"],
+            kind="stable",
+        )
+        .drop(columns=["_age_order"])
+        .reset_index(drop=True)
+    )
 
 st.dataframe(
     display_df,
     use_container_width=True,
     hide_index=True,
     height=650,
+    column_config={
+        "Spend": st.column_config.NumberColumn(format="%.2f"),
+    },
 )
 
 csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
 st.download_button(
     "Download filtered CSV",
     data=csv_data,
-    file_name="meta_adset_min_max_age.csv",
+    file_name="meta_spend_by_age.csv",
     mime="text/csv",
     use_container_width=True,
     disabled=display_df.empty,
 )
 
 st.info(
-    "Min Age and Max Age are the current targeting settings returned by Meta. "
-    "The Date Range controls which Ad Sets had delivery during Today, Yesterday, Last 7 Days, This Month or Last Month; "
-    "it does not reconstruct historical changes to the targeting settings."
+    "Spend is taken from Meta Insights with breakdowns=age and is shown for the selected Date Range. "
+    "Age values are Meta's reporting buckets (for example 18-24, 25-34, 35-44, 45-54, 55-64 and 65+)."
 )
+
 
 if show_account_sources:
     with st.expander("Loaded Ad Account Sources", expanded=False):
