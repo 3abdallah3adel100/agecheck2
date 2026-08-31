@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from io import BytesIO
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,7 +15,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Meta Age Spend Breakdown", layout="wide")
 
-APP_BUILD = "2026-08-27-age-spend-breakdown-v1"
+APP_BUILD = "2026-08-31-age-spend-excel-v2"
 
 
 # =========================================================
@@ -104,12 +105,14 @@ DATA_DIR = Path("app_data")
 DATA_DIR.mkdir(exist_ok=True)
 
 AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.csv"
+DAILY_AGE_SPEND_FILE = DATA_DIR / "age_spend_daily_snapshot.csv"
 ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.csv"
 RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.csv"
 META_FILE = DATA_DIR / "age_targeting_meta_snapshot.json"
 LOCK_FILE = DATA_DIR / "age_targeting_refresh.lock"
 
 TMP_AGE_TARGETING_FILE = DATA_DIR / "age_targeting_min_max_snapshot.tmp.csv"
+TMP_DAILY_AGE_SPEND_FILE = DATA_DIR / "age_spend_daily_snapshot.tmp.csv"
 TMP_ACCOUNTS_FILE = DATA_DIR / "age_targeting_accounts_snapshot.tmp.csv"
 TMP_RAW_ACCOUNTS_FILE = DATA_DIR / "age_targeting_raw_accounts_snapshot.tmp.csv"
 TMP_META_FILE = DATA_DIR / "age_targeting_meta_snapshot.tmp.json"
@@ -698,6 +701,61 @@ def build_age_spend_rows(age_spend_df):
     return output
 
 
+def build_daily_age_spend_rows(age_spend_df):
+    """Keep true day-by-day Spend by age so Excel exports can show Day 1, 2, 3... accurately."""
+    output = {}
+    if age_spend_df.empty or "adset_id" not in age_spend_df.columns:
+        return output
+
+    working = age_spend_df.copy()
+    working["adset_id"] = working["adset_id"].fillna("").astype(str)
+    working["age_bucket"] = (
+        working["age"].fillna("Unknown").astype(str)
+        if "age" in working.columns
+        else "Unknown"
+    )
+    working["delivery_date"] = pd.to_datetime(
+        working.get("date_start", ""), errors="coerce"
+    ).dt.date
+    working["daily_impressions"] = pd.to_numeric(
+        working.get("impressions", 0), errors="coerce"
+    ).fillna(0)
+    working["daily_spend"] = pd.to_numeric(
+        working.get("spend", 0), errors="coerce"
+    ).fillna(0.0)
+
+    working = working[
+        working["delivery_date"].notna()
+        & working["adset_id"].ne("")
+        & working["age_bucket"].ne("")
+    ].copy()
+
+    if working.empty:
+        return output
+
+    grouped = (
+        working.groupby(
+            ["adset_id", "delivery_date", "age_bucket"],
+            dropna=False,
+            as_index=False,
+        )[["daily_spend", "daily_impressions"]]
+        .sum()
+    )
+
+    for adset_id, group in grouped.groupby("adset_id", dropna=False):
+        output[str(adset_id)] = [
+            {
+                "delivery_date": str(row["delivery_date"]),
+                "age_bucket": str(row["age_bucket"]),
+                "daily_spend": float(row["daily_spend"]),
+                "daily_impressions": float(row["daily_impressions"]),
+            }
+            for _, row in group.iterrows()
+        ]
+
+    return output
+
+
 def fetch_one_account(row):
     account_id = row.get("id") or row.get("account_id")
     account_name = row.get("name", "Unknown")
@@ -719,14 +777,17 @@ def fetch_one_account(row):
                 bounds["query_until"],
             )
             age_spend_by_adset = build_age_spend_rows(age_spend_df)
+            daily_age_spend_by_adset = build_daily_age_spend_rows(age_spend_df)
         except Exception as exc:
             age_spend_by_adset = {}
+            daily_age_spend_by_adset = {}
             message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
             delivery_error = f"{account_name} age Spend Insights: {message}"
 
         if adsets_df.empty:
             return {
                 "rows": pd.DataFrame(),
+                "daily_rows": pd.DataFrame(),
                 "account_name": account_name,
                 "error": delivery_error,
             }
@@ -745,6 +806,8 @@ def fetch_one_account(row):
         media_buyer = MEDIA_BUYER_MAP.get(buyer_code, "Unknown")
 
         output_rows = []
+        output_daily_rows = []
+
         for _, adset in adsets_df.iterrows():
             campaign_id = str(adset.get("campaign_id", ""))
             campaign = campaign_map.get(campaign_id, {})
@@ -754,45 +817,44 @@ def fetch_one_account(row):
                 targeting = {}
 
             adset_id = str(adset.get("id", ""))
-            age_rows = age_spend_by_adset.get(adset_id, [])
+            common = {
+                "business_id": str(business_id),
+                "business_name": str(business_name),
+                "business_unit": detect_business_unit(
+                    account_name=account_name,
+                    campaign_name=campaign_name,
+                    source=source,
+                ),
+                "buyer_code": buyer_code,
+                "media_buyer": media_buyer,
+                "account_id": str(account_id),
+                "account_name": account_name,
+                "account_currency": account_currency,
+                "campaign_id": campaign_id,
+                "campaign_name": campaign_name,
+                "campaign_status": campaign_status_label(
+                    campaign.get("status"),
+                    campaign.get("effective_status"),
+                ),
+                "adset_id": adset_id,
+                "adset_name": adset.get("name", "Unknown Ad Set"),
+                "adset_status": adset_status_label(
+                    adset.get("status"),
+                    adset.get("effective_status"),
+                ),
+                "min_age": format_min_age(targeting),
+                "max_age": format_max_age(targeting),
+            }
 
-            # One output row per Meta age bucket, so Spend can be filtered/summed
-            # independently for 18-24, 25-34, 35-44, 45-54, 55-64, 65+, etc.
-            for age_metrics in age_rows:
-                output_rows.append(
-                    {
-                        "business_id": str(business_id),
-                        "business_name": str(business_name),
-                        "business_unit": detect_business_unit(
-                            account_name=account_name,
-                            campaign_name=campaign_name,
-                            source=source,
-                        ),
-                        "buyer_code": buyer_code,
-                        "media_buyer": media_buyer,
-                        "account_id": str(account_id),
-                        "account_name": account_name,
-                        "account_currency": account_currency,
-                        "campaign_id": campaign_id,
-                        "campaign_name": campaign_name,
-                        "campaign_status": campaign_status_label(
-                            campaign.get("status"),
-                            campaign.get("effective_status"),
-                        ),
-                        "adset_id": adset_id,
-                        "adset_name": adset.get("name", "Unknown Ad Set"),
-                        "adset_status": adset_status_label(
-                            adset.get("status"),
-                            adset.get("effective_status"),
-                        ),
-                        "min_age": format_min_age(targeting),
-                        "max_age": format_max_age(targeting),
-                        **age_metrics,
-                    }
-                )
+            for age_metrics in age_spend_by_adset.get(adset_id, []):
+                output_rows.append({**common, **age_metrics})
+
+            for daily_metrics in daily_age_spend_by_adset.get(adset_id, []):
+                output_daily_rows.append({**common, **daily_metrics})
 
         return {
             "rows": pd.DataFrame(output_rows),
+            "daily_rows": pd.DataFrame(output_daily_rows),
             "account_name": account_name,
             "error": delivery_error,
         }
@@ -801,6 +863,7 @@ def fetch_one_account(row):
         message = exc.display_text() if isinstance(exc, MetaAPIError) else str(exc)
         return {
             "rows": pd.DataFrame(),
+            "daily_rows": pd.DataFrame(),
             "account_name": account_name,
             "error": f"{account_name}: {message}",
         }
@@ -843,6 +906,7 @@ def load_snapshot():
 
     return {
         "age_targeting": safe_read_csv(AGE_TARGETING_FILE),
+        "daily_age_spend": safe_read_csv(DAILY_AGE_SPEND_FILE),
         "accounts": safe_read_csv(ACCOUNTS_FILE),
         "raw_accounts": safe_read_csv(RAW_ACCOUNTS_FILE),
         "meta": meta,
@@ -874,14 +938,16 @@ def csv_safe_dataframe(dataframe):
     return safe_df
 
 
-def save_snapshot_atomic(age_targeting_df, accounts_df, raw_accounts_df, meta):
-    """Save atomically using CSV, avoiding pyarrow/parquet completely."""
+def save_snapshot_atomic(age_targeting_df, daily_age_spend_df, accounts_df, raw_accounts_df, meta):
+    """Save atomically using CSV, including true daily age Spend for Excel reporting."""
     safe_age_targeting_df = csv_safe_dataframe(age_targeting_df)
+    safe_daily_age_spend_df = csv_safe_dataframe(daily_age_spend_df)
     safe_accounts_df = csv_safe_dataframe(accounts_df)
     safe_raw_accounts_df = csv_safe_dataframe(raw_accounts_df)
 
     temp_files = [
         TMP_AGE_TARGETING_FILE,
+        TMP_DAILY_AGE_SPEND_FILE,
         TMP_ACCOUNTS_FILE,
         TMP_RAW_ACCOUNTS_FILE,
         TMP_META_FILE,
@@ -889,25 +955,23 @@ def save_snapshot_atomic(age_targeting_df, accounts_df, raw_accounts_df, meta):
 
     try:
         safe_age_targeting_df.to_csv(
-            TMP_AGE_TARGETING_FILE,
-            index=False,
-            encoding="utf-8",
+            TMP_AGE_TARGETING_FILE, index=False, encoding="utf-8"
+        )
+        safe_daily_age_spend_df.to_csv(
+            TMP_DAILY_AGE_SPEND_FILE, index=False, encoding="utf-8"
         )
         safe_accounts_df.to_csv(
-            TMP_ACCOUNTS_FILE,
-            index=False,
-            encoding="utf-8",
+            TMP_ACCOUNTS_FILE, index=False, encoding="utf-8"
         )
         safe_raw_accounts_df.to_csv(
-            TMP_RAW_ACCOUNTS_FILE,
-            index=False,
-            encoding="utf-8",
+            TMP_RAW_ACCOUNTS_FILE, index=False, encoding="utf-8"
         )
 
         with open(TMP_META_FILE, "w", encoding="utf-8") as file:
             json.dump(meta, file, ensure_ascii=False, indent=2)
 
         os.replace(TMP_AGE_TARGETING_FILE, AGE_TARGETING_FILE)
+        os.replace(TMP_DAILY_AGE_SPEND_FILE, DAILY_AGE_SPEND_FILE)
         os.replace(TMP_ACCOUNTS_FILE, ACCOUNTS_FILE)
         os.replace(TMP_RAW_ACCOUNTS_FILE, RAW_ACCOUNTS_FILE)
         os.replace(TMP_META_FILE, META_FILE)
@@ -921,6 +985,7 @@ def save_snapshot_atomic(age_targeting_df, accounts_df, raw_accounts_df, meta):
             "Could not save the local CSV snapshot. "
             f"Original error: {type(exc).__name__}: {exc}"
         ) from exc
+
 
 def build_account_sources_table(raw_accounts):
     if raw_accounts.empty:
@@ -1058,6 +1123,7 @@ if refresh_clicked:
                 st.stop()
 
             all_rows = []
+            all_daily_rows = []
             errors = list(account_discovery_errors)
             progress = st.progress(0)
             progress_text = st.empty()
@@ -1079,6 +1145,8 @@ if refresh_clicked:
 
                     if not result["rows"].empty:
                         all_rows.append(result["rows"])
+                    if not result.get("daily_rows", pd.DataFrame()).empty:
+                        all_daily_rows.append(result["daily_rows"])
 
                     done += 1
                     elapsed = time.time() - started_at
@@ -1125,6 +1193,50 @@ if refresh_clicked:
                 )
             )
 
+            daily_age_spend_df = (
+                pd.concat(all_daily_rows, ignore_index=True)
+                if all_daily_rows
+                else pd.DataFrame(
+                    columns=[
+                        "business_id",
+                        "business_name",
+                        "business_unit",
+                        "buyer_code",
+                        "media_buyer",
+                        "account_id",
+                        "account_name",
+                        "account_currency",
+                        "campaign_id",
+                        "campaign_name",
+                        "campaign_status",
+                        "adset_id",
+                        "adset_name",
+                        "adset_status",
+                        "min_age",
+                        "max_age",
+                        "delivery_date",
+                        "age_bucket",
+                        "daily_spend",
+                        "daily_impressions",
+                    ]
+                )
+            )
+
+            if not daily_age_spend_df.empty:
+                daily_age_spend_df = daily_age_spend_df.sort_values(
+                    [
+                        "business_name",
+                        "business_unit",
+                        "media_buyer",
+                        "account_name",
+                        "campaign_name",
+                        "adset_name",
+                        "delivery_date",
+                        "age_bucket",
+                    ],
+                    kind="stable",
+                ).reset_index(drop=True)
+
             if not age_targeting_df.empty:
                 age_targeting_df = age_targeting_df.sort_values(
                     [
@@ -1148,6 +1260,7 @@ if refresh_clicked:
                 if "adset_id" in age_targeting_df.columns
                 else 0,
                 "age_spend_rows_count": int(len(age_targeting_df)),
+                "daily_age_rows_count": int(len(daily_age_spend_df)),
                 "discovered_businesses_count": int(len(businesses_df)),
                 "discovered_businesses": businesses_df.to_dict("records") if not businesses_df.empty else [],
                 "extra_business_ids": EXTRA_BUSINESS_IDS,
@@ -1155,11 +1268,12 @@ if refresh_clicked:
                 "delivery_query_until": str(delivery_window_dates()["query_until"]),
                 "errors_count": int(len(errors)),
                 "errors": errors[:100],
-                "data_scope": "Daily Ad Set Insights with breakdowns=age, aggregated into selectable Spend date windows.",
+                "data_scope": "Daily Ad Set Insights with breakdowns=age, stored both daily and aggregated into selectable Spend date windows.",
             }
 
             save_snapshot_atomic(
                 age_targeting_df,
+                daily_age_spend_df,
                 accounts_df,
                 build_account_sources_table(raw_accounts_df),
                 meta,
@@ -1182,6 +1296,7 @@ if not snapshot:
 
 
 age_df = snapshot["age_targeting"].copy()
+daily_age_df = snapshot.get("daily_age_spend", pd.DataFrame()).copy()
 accounts_df = snapshot["accounts"].copy()
 raw_accounts_df = snapshot["raw_accounts"].copy()
 meta = snapshot["meta"]
@@ -1192,6 +1307,7 @@ st.caption(
     f" | Fetched accounts: {meta.get('accounts_count', 0)}"
     f" | Ad Sets: {meta.get('adsets_count', 0)}"
     f" | Age rows: {meta.get('age_spend_rows_count', 0)}"
+    f" | Daily rows: {meta.get('daily_age_rows_count', 0)}"
     f" | Errors: {meta.get('errors_count', 0)}"
 )
 
@@ -1428,6 +1544,385 @@ AGE_ORDER = {
     "Unknown": 99,
 }
 
+
+def selected_range_bounds(range_name):
+    bounds = delivery_window_dates()
+    mapping = {
+        "Today": (bounds["today"], bounds["today"]),
+        "Yesterday": (bounds["yesterday"], bounds["yesterday"]),
+        "Last 7 Days": (bounds["last_7d_start"], bounds["today"]),
+        "This Month": (bounds["this_month_start"], bounds["today"]),
+        "Last Month": (bounds["last_month_start"], bounds["last_month_end"]),
+    }
+    return mapping.get(range_name, (bounds["today"], bounds["today"]))
+
+
+def prepare_daily_export_rows(daily_df, filtered_summary_df, range_name):
+    if daily_df.empty or filtered_summary_df.empty:
+        return pd.DataFrame()
+
+    required_keys = ["account_id", "campaign_id", "adset_id", "age_bucket"]
+    if any(column not in daily_df.columns for column in required_keys):
+        return pd.DataFrame()
+
+    working = daily_df.copy()
+    for column in required_keys:
+        working[column] = working[column].fillna("").astype(str)
+
+    allowed = filtered_summary_df[required_keys].copy().drop_duplicates()
+    for column in required_keys:
+        allowed[column] = allowed[column].fillna("").astype(str)
+
+    working = working.merge(allowed, on=required_keys, how="inner")
+    if working.empty:
+        return working
+
+    working["delivery_date_parsed"] = pd.to_datetime(
+        working.get("delivery_date", ""), errors="coerce"
+    )
+    working["daily_spend_num"] = pd.to_numeric(
+        working.get("daily_spend", 0), errors="coerce"
+    ).fillna(0.0)
+
+    start_date, end_date = selected_range_bounds(range_name)
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    working = working[
+        working["delivery_date_parsed"].between(start_ts, end_ts)
+    ].copy()
+    return working
+
+
+def build_daily_overall_table(daily_export_df, range_name):
+    start_date, end_date = selected_range_bounds(range_name)
+    full_dates = pd.date_range(start_date, end_date, freq="D")
+
+    if daily_export_df.empty:
+        return pd.DataFrame(columns=["Currency", "Day", "Date", "Total Spend"])
+
+    currencies = sorted(
+        daily_export_df.get("account_currency", pd.Series([""]))
+        .fillna("")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    ages = sorted(
+        daily_export_df["age_bucket"].fillna("Unknown").astype(str).unique().tolist(),
+        key=lambda value: (AGE_ORDER.get(value, 90), value),
+    )
+
+    rows = []
+    for currency in currencies:
+        currency_df = daily_export_df[
+            daily_export_df["account_currency"].fillna("").astype(str) == currency
+        ].copy()
+        pivot = currency_df.pivot_table(
+            index="delivery_date_parsed",
+            columns="age_bucket",
+            values="daily_spend_num",
+            aggfunc="sum",
+            fill_value=0.0,
+        ).reindex(index=full_dates, fill_value=0.0)
+        pivot = pivot.reindex(columns=ages, fill_value=0.0)
+
+        for day in full_dates:
+            row = {
+                "Currency": currency,
+                "Day": int(day.day),
+                "Date": day.to_pydatetime(),
+            }
+            for age in ages:
+                row[age] = float(pivot.loc[day, age]) if age in pivot.columns else 0.0
+            row["Total Spend"] = sum(row.get(age, 0.0) for age in ages)
+            rows.append(row)
+
+        total_row = {"Currency": currency, "Day": "TOTAL", "Date": None}
+        for age in ages:
+            total_row[age] = float(currency_df.loc[
+                currency_df["age_bucket"].astype(str) == age, "daily_spend_num"
+            ].sum())
+        total_row["Total Spend"] = float(currency_df["daily_spend_num"].sum())
+        rows.append(total_row)
+
+    return pd.DataFrame(rows)
+
+
+def build_age_analysis_tables(daily_export_df):
+    analysis_columns = [
+        "Currency", "Age", "Spend", "Share %", "Ad Accounts", "Ad Sets",
+        "Avg Daily Spend", "Peak Day", "Peak Day Spend",
+        "Top 1 Ad Account", "Top 1 Spend",
+        "Top 2 Ad Account", "Top 2 Spend",
+        "Top 3 Ad Account", "Top 3 Spend",
+    ]
+    account_columns = [
+        "Currency", "Ad Account", "Media Buyer", "Total Spend", "Share %",
+        "Top Age", "Top Age Spend", "Age Buckets", "Ad Sets",
+    ]
+
+    if daily_export_df.empty:
+        return pd.DataFrame(columns=analysis_columns), pd.DataFrame(columns=account_columns)
+
+    work = daily_export_df.copy()
+    work["account_currency"] = work["account_currency"].fillna("").astype(str)
+    work["age_bucket"] = work["age_bucket"].fillna("Unknown").astype(str)
+    work["account_name"] = work["account_name"].fillna("Unknown").astype(str)
+    work["media_buyer"] = work["media_buyer"].fillna("Unknown").astype(str)
+
+    analysis_rows = []
+    for (currency, age), group in work.groupby(["account_currency", "age_bucket"], dropna=False):
+        currency_total = float(work.loc[work["account_currency"] == currency, "daily_spend_num"].sum())
+        spend = float(group["daily_spend_num"].sum())
+        account_rank = (
+            group.groupby("account_name", as_index=False)["daily_spend_num"]
+            .sum()
+            .sort_values("daily_spend_num", ascending=False, kind="stable")
+            .reset_index(drop=True)
+        )
+        peak = (
+            group.groupby("delivery_date_parsed", as_index=False)["daily_spend_num"]
+            .sum()
+            .sort_values("daily_spend_num", ascending=False, kind="stable")
+            .reset_index(drop=True)
+        )
+        unique_days = max(1, int(group["delivery_date_parsed"].dt.normalize().nunique()))
+
+        row = {
+            "Currency": currency,
+            "Age": age,
+            "Spend": spend,
+            "Share %": (spend / currency_total) if currency_total else 0.0,
+            "Ad Accounts": int(group["account_id"].astype(str).nunique()),
+            "Ad Sets": int(group["adset_id"].astype(str).nunique()),
+            "Avg Daily Spend": spend / unique_days,
+            "Peak Day": peak.iloc[0]["delivery_date_parsed"].to_pydatetime() if not peak.empty else None,
+            "Peak Day Spend": float(peak.iloc[0]["daily_spend_num"]) if not peak.empty else 0.0,
+        }
+        for rank in range(3):
+            if rank < len(account_rank):
+                row[f"Top {rank + 1} Ad Account"] = account_rank.iloc[rank]["account_name"]
+                row[f"Top {rank + 1} Spend"] = float(account_rank.iloc[rank]["daily_spend_num"])
+            else:
+                row[f"Top {rank + 1} Ad Account"] = ""
+                row[f"Top {rank + 1} Spend"] = 0.0
+        analysis_rows.append(row)
+
+    age_analysis = pd.DataFrame(analysis_rows, columns=analysis_columns)
+    age_analysis["_age_order"] = age_analysis["Age"].map(AGE_ORDER).fillna(90)
+    age_analysis = (
+        age_analysis.sort_values(["Currency", "_age_order", "Age"], kind="stable")
+        .drop(columns=["_age_order"])
+        .reset_index(drop=True)
+    )
+
+    account_rows = []
+    for (currency, account_name), group in work.groupby(["account_currency", "account_name"], dropna=False):
+        currency_total = float(work.loc[work["account_currency"] == currency, "daily_spend_num"].sum())
+        total = float(group["daily_spend_num"].sum())
+        age_rank = (
+            group.groupby("age_bucket", as_index=False)["daily_spend_num"]
+            .sum()
+            .sort_values("daily_spend_num", ascending=False, kind="stable")
+            .reset_index(drop=True)
+        )
+        media_buyer = group["media_buyer"].iloc[0] if not group.empty else "Unknown"
+        account_rows.append({
+            "Currency": currency,
+            "Ad Account": account_name,
+            "Media Buyer": media_buyer,
+            "Total Spend": total,
+            "Share %": (total / currency_total) if currency_total else 0.0,
+            "Top Age": age_rank.iloc[0]["age_bucket"] if not age_rank.empty else "",
+            "Top Age Spend": float(age_rank.iloc[0]["daily_spend_num"]) if not age_rank.empty else 0.0,
+            "Age Buckets": int(group["age_bucket"].nunique()),
+            "Ad Sets": int(group["adset_id"].astype(str).nunique()),
+        })
+
+    account_analysis = pd.DataFrame(account_rows, columns=account_columns)
+    account_analysis = account_analysis.sort_values(
+        ["Currency", "Total Spend"], ascending=[True, False], kind="stable"
+    ).reset_index(drop=True)
+    return age_analysis, account_analysis
+
+
+def build_excel_report(display_df, filtered_summary_df, daily_df, range_name):
+    daily_export = prepare_daily_export_rows(daily_df, filtered_summary_df, range_name)
+    daily_overall = build_daily_overall_table(daily_export, range_name)
+    age_analysis, account_analysis = build_age_analysis_tables(daily_export)
+
+    output = BytesIO()
+    with pd.ExcelWriter(
+        output,
+        engine="xlsxwriter",
+        datetime_format="yyyy-mm-dd",
+        date_format="yyyy-mm-dd",
+    ) as writer:
+        workbook = writer.book
+
+        title_fmt = workbook.add_format({
+            "bold": True, "font_size": 16, "font_color": "#FFFFFF",
+            "bg_color": "#17365D", "align": "center", "valign": "vcenter",
+        })
+        header_fmt = workbook.add_format({
+            "bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78",
+            "border": 1, "align": "center", "valign": "vcenter",
+        })
+        money_fmt = workbook.add_format({"num_format": "#,##0.00", "border": 1})
+        pct_fmt = workbook.add_format({"num_format": "0.00%", "border": 1})
+        date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd", "border": 1})
+        body_fmt = workbook.add_format({"border": 1})
+        total_fmt = workbook.add_format({
+            "bold": True, "bg_color": "#D9EAF7", "border": 1, "num_format": "#,##0.00"
+        })
+        kpi_label_fmt = workbook.add_format({
+            "bold": True, "font_color": "#666666", "align": "center",
+            "bg_color": "#F2F2F2", "border": 1,
+        })
+        kpi_value_fmt = workbook.add_format({
+            "bold": True, "font_size": 13, "align": "center",
+            "bg_color": "#FFFFFF", "border": 1, "num_format": "#,##0.00",
+        })
+
+        # Tab 1 — same detailed table currently downloaded as CSV.
+        display_df.to_excel(writer, sheet_name="Ad Set Details", index=False)
+        ws1 = writer.sheets["Ad Set Details"]
+        ws1.freeze_panes(1, 0)
+        ws1.autofilter(0, 0, max(len(display_df), 1), max(len(display_df.columns) - 1, 0))
+        ws1.set_row(0, 24, header_fmt)
+        widths = [28, 34, 34, 12, 15, 12]
+        for idx, width in enumerate(widths[:len(display_df.columns)]):
+            ws1.set_column(idx, idx, width)
+        if "Spend" in display_df.columns:
+            spend_col = display_df.columns.get_loc("Spend")
+            ws1.set_column(spend_col, spend_col, 15, money_fmt)
+
+        # Tab 2 — day-by-day Overall Spend by Meta age bucket.
+        daily_start_row = 3
+        daily_overall.to_excel(
+            writer, sheet_name="Daily Overall", index=False, startrow=daily_start_row
+        )
+        ws2 = writer.sheets["Daily Overall"]
+        last_col2 = max(len(daily_overall.columns) - 1, 0)
+        ws2.merge_range(0, 0, 0, last_col2, f"Daily Overall Spend by Age — {range_name}", title_fmt)
+        ws2.write(1, 0, "Rows = calendar days | Columns = Meta age buckets | TOTAL row = full selected period")
+        ws2.freeze_panes(daily_start_row + 1, 3)
+        ws2.set_row(daily_start_row, 24, header_fmt)
+        ws2.autofilter(daily_start_row, 0, daily_start_row + max(len(daily_overall), 1), last_col2)
+        for col_idx, col_name in enumerate(daily_overall.columns):
+            if col_name == "Currency":
+                ws2.set_column(col_idx, col_idx, 12, body_fmt)
+            elif col_name == "Day":
+                ws2.set_column(col_idx, col_idx, 10, body_fmt)
+            elif col_name == "Date":
+                ws2.set_column(col_idx, col_idx, 13, date_fmt)
+            else:
+                ws2.set_column(col_idx, col_idx, 15, money_fmt)
+        if not daily_overall.empty:
+            for row_idx, value in enumerate(daily_overall["Day"], start=daily_start_row + 1):
+                if str(value) == "TOTAL":
+                    ws2.set_row(row_idx, None, total_fmt)
+
+        # Tab 3 — executive analysis.
+        ws3 = workbook.add_worksheet("Age Analysis")
+        writer.sheets["Age Analysis"] = ws3
+        ws3.merge_range("A1:O1", f"Executive Age Spend Analysis — {range_name}", title_fmt)
+
+        currencies = sorted(daily_export["account_currency"].fillna("").astype(str).unique().tolist()) if not daily_export.empty else []
+        total_spend_text = " / ".join(
+            f"{cur or 'N/A'} {daily_export.loc[daily_export['account_currency'].fillna('').astype(str) == cur, 'daily_spend_num'].sum():,.2f}"
+            for cur in currencies
+        ) or "0.00"
+        top_age = "-"
+        top_age_share = 0.0
+        top_age_share_is_numeric = True
+        if not age_analysis.empty and len(currencies) == 1:
+            top_row = age_analysis.sort_values("Spend", ascending=False).iloc[0]
+            top_age = f"{top_row['Age']} ({top_row['Currency']})"
+            top_age_share = float(top_row["Share %"])
+        elif not age_analysis.empty:
+            top_parts = []
+            share_parts = []
+            for currency in currencies:
+                currency_rows = age_analysis[age_analysis["Currency"].astype(str) == currency]
+                if currency_rows.empty:
+                    continue
+                top_row = currency_rows.sort_values("Spend", ascending=False).iloc[0]
+                top_parts.append(f"{currency or 'N/A'}: {top_row['Age']}")
+                share_parts.append(f"{currency or 'N/A'}: {float(top_row['Share %']):.1%}")
+            top_age = " | ".join(top_parts) or "-"
+            top_age_share = " | ".join(share_parts) or "-"
+            top_age_share_is_numeric = False
+
+        kpis = [
+            ("Total Spend", total_spend_text),
+            ("Top Age", top_age),
+            ("Top Age Share", top_age_share),
+            ("Ad Accounts", int(daily_export["account_id"].nunique()) if not daily_export.empty else 0),
+            ("Date Range", range_name),
+        ]
+        for idx, (label, value) in enumerate(kpis):
+            col = idx * 3
+            ws3.merge_range(2, col, 2, col + 1, label, kpi_label_fmt)
+            value_format = pct_fmt if label == "Top Age Share" and top_age_share_is_numeric else kpi_value_fmt
+            ws3.merge_range(3, col, 3, col + 1, value, value_format)
+
+        age_start = 6
+        age_analysis.to_excel(writer, sheet_name="Age Analysis", index=False, startrow=age_start)
+        ws3.set_row(age_start, 24, header_fmt)
+        ws3.freeze_panes(age_start + 1, 2)
+        for col_idx, col_name in enumerate(age_analysis.columns):
+            width = 18
+            if "Ad Account" in col_name:
+                width = 30
+            elif col_name in {"Currency", "Age"}:
+                width = 12
+            elif col_name == "Peak Day":
+                width = 14
+            fmt = body_fmt
+            if col_name in {"Spend", "Avg Daily Spend", "Peak Day Spend", "Top 1 Spend", "Top 2 Spend", "Top 3 Spend"}:
+                fmt = money_fmt
+            elif col_name == "Share %":
+                fmt = pct_fmt
+            elif col_name == "Peak Day":
+                fmt = date_fmt
+            ws3.set_column(col_idx, col_idx, width, fmt)
+
+        account_start = age_start + len(age_analysis) + 4
+        ws3.write(account_start - 1, 0, "Ad Account Ranking", header_fmt)
+        account_analysis.to_excel(
+            writer, sheet_name="Age Analysis", index=False, startrow=account_start
+        )
+        ws3.set_row(account_start, 24, header_fmt)
+        for col_idx, col_name in enumerate(account_analysis.columns):
+            width = 18
+            if col_name == "Ad Account":
+                width = 32
+            elif col_name == "Media Buyer":
+                width = 22
+            fmt = body_fmt
+            if col_name in {"Total Spend", "Top Age Spend"}:
+                fmt = money_fmt
+            elif col_name == "Share %":
+                fmt = pct_fmt
+            ws3.set_column(col_idx, col_idx, width, fmt)
+
+        if not age_analysis.empty and len(currencies) == 1:
+            chart = workbook.add_chart({"type": "doughnut"})
+            chart.add_series({
+                "name": "Spend Share by Age",
+                "categories": ["Age Analysis", age_start + 1, 1, age_start + len(age_analysis), 1],
+                "values": ["Age Analysis", age_start + 1, 2, age_start + len(age_analysis), 2],
+                "data_labels": {"percentage": True},
+            })
+            chart.set_title({"name": "Spend Share by Age"})
+            chart.set_legend({"position": "bottom"})
+            chart.set_style(10)
+            ws3.insert_chart("Q2", chart, {"x_scale": 1.15, "y_scale": 1.15})
+
+    output.seek(0)
+    return output.getvalue()
+
 age_options = (
     sorted(
         filtered["age_bucket"].dropna().astype(str).unique().tolist(),
@@ -1579,14 +2074,34 @@ st.dataframe(
     },
 )
 
-csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+if daily_age_df.empty:
+    st.warning(
+        "Daily Excel reporting data is not in the saved snapshot yet. "
+        "Click Refresh Age Data once after deploying this version."
+    )
+    excel_data = b""
+else:
+    try:
+        excel_data = build_excel_report(
+            display_df=display_df,
+            filtered_summary_df=filtered,
+            daily_df=daily_age_df,
+            range_name=selected_date_range,
+        )
+    except Exception as exc:
+        excel_data = b""
+        st.error(
+            "Could not build the Excel report. Make sure `xlsxwriter` is in requirements.txt. "
+            f"Error: {exc}"
+        )
+
 st.download_button(
-    "Download filtered CSV",
-    data=csv_data,
-    file_name="meta_spend_by_age.csv",
-    mime="text/csv",
+    "Download Professional Excel Report",
+    data=excel_data,
+    file_name=f"meta_spend_by_age_{selected_date_range.lower().replace(' ', '_')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     use_container_width=True,
-    disabled=display_df.empty,
+    disabled=display_df.empty or not excel_data,
 )
 
 st.info(
